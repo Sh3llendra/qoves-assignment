@@ -1,0 +1,13 @@
+# Never commit plaintext secrets or private keys
+*.key
+*.pem
+*-plain.yaml
+secret*.yaml
+!*sealed*.yaml
+.env
+*.env
+
+# Local tooling
+.DS_Store
+__pycache__/
+*.pyc
