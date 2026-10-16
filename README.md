@@ -26,7 +26,7 @@ qoves-takehome/
 │   ├── network/                  # Default-deny + allow-list NetworkPolicies
 │   ├── api/                      # API Deployment, Service, Ingress, HPA
 │   └── monitoring/               # ServiceMonitor, PrometheusRule
-├── WRITEUP.md
+├── README.md
 └── .gitignore
 ```
 
