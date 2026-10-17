@@ -33,33 +33,48 @@ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2
 kubectl wait --for=condition=available deploy/argocd-server -n argocd --timeout=300s
 ```
 
-### Generate the Sealed Secret
+### Deploy via GitOps (Two-Phase Approach)
 
-```bash
-kubectl create namespace qoves
+The sealed-secrets controller must be running before `kubeseal` can encrypt. This requires a two-phase deploy:
 
-kubectl create secret generic qoves-db-credentials \
-  --namespace=qoves \
-  --from-literal=POSTGRES_USER=qoves \
-  --from-literal=POSTGRES_PASSWORD=changeme \
-  --from-literal=POSTGRES_DB=qovesdb \
-  --from-literal=DATABASE_URL="postgresql://qoves:changeme@postgres.qoves.svc:5432/qovesdb" \
-  --dry-run=client -o yaml | \
-kubeseal --controller-name=sealed-secrets \
-  --controller-namespace=kube-system \
-  --format=yaml > manifests/data/qoves-db-sealed.yaml
-```
-
-Commit and push the sealed secret (never the plaintext).
-
-### Deploy via GitOps
+**Phase 1 — Push manifests and apply the root application:**
 
 ```bash
 git add -A && git commit -m "populate manifests" && git push origin main
 kubectl apply -f bootstrap/root-application.yaml
 ```
 
-ArgoCD discovers `applications/`, creates child Applications, and reconciles all manifests into the cluster.
+ArgoCD discovers `applications/`, creates child Applications, and reconciles all manifests into the cluster. The sealed-secrets controller (sync-wave 0) deploys first.
+
+Wait for the sealed-secrets controller:
+
+```bash
+kubectl wait --for=condition=available deploy/sealed-secrets -n kube-system --timeout=300s
+```
+
+**Phase 2 — Generate and push the real sealed secret:**
+
+```bash
+kubectl create secret generic qoves-db-credentials \
+  --namespace=qoves \
+  --from-literal=POSTGRES_USER=qoves \
+  --from-literal=POSTGRES_PASSWORD=changeme \
+  --from-literal=POSTGRES_DB=qovesdb \
+  --from-literal=DATABASE_URL="postgresql://qoves:changeme@postgres.qoves.svc:5432/qovesdb" \
+  --dry-run=client -o yaml > /tmp/db-secret-plain.yaml
+
+kubeseal --controller-name=sealed-secrets \
+  --controller-namespace=kube-system \
+  --format=yaml < /tmp/db-secret-plain.yaml > manifests/data/qoves-db-sealed.yaml
+
+rm /tmp/db-secret-plain.yaml
+
+git add manifests/data/qoves-db-sealed.yaml
+git commit -m "add real sealed secret for database credentials"
+git push origin main
+```
+
+ArgoCD syncs the sealed secret; the controller decrypts it into a native Secret; Postgres and the API pods pick it up and start.
 
 ### Repo Layout
 
@@ -107,21 +122,41 @@ qoves-assignment/
 ### Validation
 
 ```bash
-# Add host entry
-echo "$(minikube ip) qoves.local" | sudo tee -a /etc/hosts
-
-# Health check through ingress
-curl -H "Host: qoves.local" http://$(minikube ip)/healthz
-
 # All resources
 kubectl get pods,svc,ingress,netpol -n qoves
 
 # ArgoCD app tree
 kubectl get applications -n argocd
 
+# Health check through the ingress (port-forward on macOS + Docker driver)
+kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 8080:80 &
+curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz   # Expected: "ok"
+curl -H "Host: qoves.local" http://127.0.0.1:8080/           # Expected: "hello from the QOVES take-home API"
+curl -H "Host: qoves.local" http://127.0.0.1:8080/metrics    # Expected: Prometheus metrics
+
 # Prove NetworkPolicy blocks unauthorized egress
-kubectl run test --rm -it --image=busybox -n qoves -- wget -qO- --timeout=3 http://example.com
+kubectl run test --rm -it --image=busybox:1.36 -n qoves --restart=Never -- wget -qO- --timeout=3 http://example.com
 # Expected: timeout (blocked by default-deny egress)
+
+# Prove DNS still resolves (allowed by allow-dns-egress)
+kubectl run test-dns --rm -it --image=busybox:1.36 -n qoves --restart=Never -- nslookup postgres.qoves.svc.cluster.local
+# Expected: resolves successfully
+
+# Verify data persistence
+kubectl delete pod postgres-0 -n qoves
+kubectl wait --for=condition=ready pod/postgres-0 -n qoves --timeout=120s
+curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz   # Expected: "ok" again
+
+# Verify Prometheus scraping
+kubectl port-forward svc/kps-kube-prometheus-stack-prometheus -n monitoring 9090:9090 &
+curl -s 'http://localhost:9090/api/v1/query?query=http_requests_total' | python3 -m json.tool | head -20
+
+# Verify Grafana
+kubectl port-forward svc/kps-grafana -n monitoring 3000:80 &
+# Open http://localhost:3000 — admin / prom-operator (default)
+
+# Verify no plaintext secrets in repo
+grep -r "changeme" manifests/ || echo "No plaintext secrets found - PASS"
 ```
 
 ---
