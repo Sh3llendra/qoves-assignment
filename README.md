@@ -47,19 +47,11 @@ qoves-takehome/
 
 ## Getting Started (from scratch)
 
-### 1. Restructure the repo
+### 1. Repo structure
 
 The current repo uses `applications/` with `.yml` extensions. Align it with the target layout:
 
 ```bash
-git mv applications apps
-git mv apps/api.yml apps/qoves-api.yaml
-git mv apps/database.yml apps/qoves-data.yaml
-git mv apps/ingress.yml apps/qoves-network.yaml
-git mv apps/secrets.yml apps/sealed-secrets.yaml
-git mv apps/monitoring.yml apps/qoves-monitoring.yaml
-git mv apps/prometheus.yml apps/prometheus-stack.yaml
-git mv bootstrap/root-application.yaml bootstrap/root-app.yaml
 mkdir -p manifests/{data,network,api,monitoring}
 git add -A && git commit -m "restructure repo layout" && git push origin main
 ```
@@ -73,8 +65,8 @@ minikube start \
   --cni=calico \
   --driver=docker \
   --cpus=2 \
-  --memory=4096 \
-  --kubernetes-version=v1.30.0
+  --memory=3g \
+  --kubernetes-version=v1.37.0
 ```
 
 **Why Calico:** minikube's default CNI does not enforce NetworkPolicy — policies silently do nothing. Calico enforces them out of the box and is lighter than Cilium for local development.

@@ -10,7 +10,7 @@ spec:
   source:
     repoURL: https://github.com/Sh3llendra/qoves-assignment
     targetRevision: main
-    path: apps
+    path: applications
     directory:
       recurse: false
   destination:

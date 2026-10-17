@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: qoves-api-alerts
+  namespace: monitoring
+  labels:
+    app: qoves-api
+spec:
+  groups:
+    - name: qoves-api
+      rules:
+        - alert: QovesAPIHealthzFailing
+          expr: |
+            sum(rate(http_requests_total{path="/healthz", status="503"}[5m])) > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "QOVES API /healthz returning 503"
+            description: "The API health check has been failing for more than 2 minutes, indicating the database is unreachable."

@@ -12,14 +12,14 @@ spec:
   source:
     repoURL: https://prometheus-community.github.io/helm-charts
     chart: kube-prometheus-stack
-    targetRevision: <KPS_CHART_VERSION>
+    targetRevision: 61.2.0
     helm:
       releaseName: kps
       valuesObject:
         grafana:
-          enabled: false
+          enabled: true
         alertmanager:
-          enabled: false
+          enabled: true
         prometheus:
           prometheusSpec:
             retention: 2d
