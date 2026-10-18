@@ -1,31 +1,60 @@
-# QOVES Platform Writeup
+# QOVES Platform — Writeup
 
 ## 1. Run It
 
+Complete from-scratch setup. Every command is here — nothing is assumed to be pre-existing.
+
 ### Prerequisites
 
-- Docker (running)
-- minikube v1.37.0+
-- kubectl
-- kubeseal CLI
-- Helm (for ArgoCD install verification)
+| Tool | Install | Purpose |
+|------|---------|---------|
+| Docker Desktop | Running and healthy | Container runtime for minikube |
+| minikube | `brew install minikube` | Local Kubernetes cluster |
+| kubectl | `brew install kubectl` | Cluster CLI |
+| Helm | `brew install helm` | Required by ArgoCD for Helm-based apps |
+| kubeseal | `brew install kubeseal` | Encrypts secrets client-side |
 
-### Cluster Bootstrap
+### Step 1 — Start the Cluster with Calico CNI
 
 ```bash
-minikube start --nodes=2 --cni=calico --driver=docker --cpus=2 --memory=3g --kubernetes-version=stable
+minikube start \
+  --nodes=2 \
+  --cni=calico \
+  --driver=docker \
+  --cpus=2 \
+  --memory=3g \
+  --kubernetes-version=stable
+```
+
+Enable required addons:
+
+```bash
 minikube addons enable ingress
 minikube addons enable metrics-server
 ```
 
-### Build the Container Image
+Verify Calico is running on all nodes:
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=calico-node
+# Every node should have a calico-node pod in Running state
+```
+
+> **Note:** If the ingress addon creates a stale validating webhook that blocks Ingress creation later, delete it:
+> `kubectl delete validatingwebhookconfiguration ingress-nginx-admission`
+
+### Step 2 — Build and Load the API Image
 
 ```bash
 eval $(minikube docker-env)
 cd app && docker build -t qoves-api:0.1.0 . && cd ..
 ```
 
-### Install ArgoCD
+The Deployment uses `imagePullPolicy: Never` so Kubernetes uses the locally built image.
+
+### Step 3 — Install ArgoCD
+
+This is the only imperative install. Everything after this is GitOps-managed.
 
 ```bash
 kubectl create namespace argocd
@@ -33,18 +62,39 @@ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2
 kubectl wait --for=condition=available deploy/argocd-server -n argocd --timeout=300s
 ```
 
-### Deploy via GitOps (Two-Phase Approach)
+Retrieve the admin password (for UI access):
 
-The sealed-secrets controller must be running before `kubeseal` can encrypt. This requires a two-phase deploy:
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d; echo
+```
 
-**Phase 1 — Push manifests and apply the root application:**
+Optional — access the ArgoCD UI:
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8443:443 &
+# Open https://localhost:8443 — admin / <password from above>
+```
+
+### Step 4 — Deploy via GitOps (Two-Phase Approach)
+
+The sealed-secrets controller must be running in-cluster before `kubeseal` can encrypt locally. This creates a chicken-and-egg: the controller is deployed by ArgoCD, but the sealed secret must exist for Postgres to start. Solution: deploy in two phases.
+
+**Phase 1 — Apply the root application:**
+
+The repo already has a placeholder `qoves-db-sealed.yaml`. Push all manifests and apply:
 
 ```bash
 git add -A && git commit -m "populate manifests" && git push origin main
 kubectl apply -f bootstrap/root-application.yaml
 ```
 
-ArgoCD discovers `applications/`, creates child Applications, and reconciles all manifests into the cluster. The sealed-secrets controller (sync-wave 0) deploys first.
+ArgoCD discovers `applications/`, creates child Applications in sync-wave order:
+1. **Wave 0:** `sealed-secrets` — installs the controller in `kube-system`
+2. **Wave 1:** `qoves-data` + `qoves-network` — Postgres StatefulSet, NetworkPolicies
+3. **Wave 2:** `qoves-api` + `prometheus-stack` — API Deployment, kube-prometheus-stack
+4. **Wave 3:** `qoves-monitoring` — ServiceMonitor + PrometheusRule
+
+The Postgres and API pods will be in `CreateContainerConfigError` — this is expected because the secret doesn't exist yet.
 
 Wait for the sealed-secrets controller:
 
@@ -52,7 +102,7 @@ Wait for the sealed-secrets controller:
 kubectl wait --for=condition=available deploy/sealed-secrets -n kube-system --timeout=300s
 ```
 
-**Phase 2 — Generate and push the real sealed secret:**
+**Phase 2 — Generate the real sealed secret and push:**
 
 ```bash
 kubectl create secret generic qoves-db-credentials \
@@ -74,126 +124,155 @@ git commit -m "add real sealed secret for database credentials"
 git push origin main
 ```
 
-ArgoCD syncs the sealed secret; the controller decrypts it into a native Secret; Postgres and the API pods pick it up and start.
+ArgoCD syncs the sealed secret → the controller decrypts it into a native Secret → Postgres and the API pods start.
+
+### Step 5 — Validate Everything
+
+Wait for all pods to be Running:
+
+```bash
+kubectl get pods -n qoves -w
+# postgres-0, qoves-api-xxx, qoves-api-yyy — all 1/1 Running
+```
+
+Check all ArgoCD applications:
+
+```bash
+kubectl get applications -n argocd
+# All 7 apps should show Synced / Healthy
+```
+
+**Test the API through the ingress:**
+
+```bash
+kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 8080:80 &
+
+curl -H "Host: qoves.local" http://127.0.0.1:8080/
+# Expected: "hello from the QOVES take-home API"
+
+curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz
+# Expected: "ok"
+
+curl -H "Host: qoves.local" http://127.0.0.1:8080/metrics
+# Expected: Prometheus exposition format
+```
+
+> **Why port-forward?** On macOS with Docker driver, the minikube IP (192.168.49.x) is inside a Docker network and not directly reachable from the host. Port-forwarding the ingress controller is the reliable approach. Alternatively, `minikube tunnel` (requires sudo) maps the ingress to 127.0.0.1:80.
+
+**Test NetworkPolicy enforcement:**
+
+```bash
+# Prove default-deny egress blocks unauthorized traffic
+kubectl run test-egress --rm -it --image=busybox:1.36 -n qoves --restart=Never -- \
+  wget -qO- --timeout=3 http://example.com
+# Expected: timeout (blocked)
+
+# Prove DNS still resolves (allowed by allow-dns-egress policy)
+kubectl run test-dns --rm -it --image=busybox:1.36 -n qoves --restart=Never -- \
+  nslookup postgres.qoves.svc.cluster.local
+# Expected: resolves successfully
+```
+
+**Test data persistence:**
+
+```bash
+kubectl delete pod postgres-0 -n qoves
+kubectl wait --for=condition=ready pod/postgres-0 -n qoves --timeout=120s
+curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz
+# Expected: "ok" — PVC preserved the data across restart
+```
+
+**Test HPA:**
+
+```bash
+kubectl get hpa -n qoves
+# Should show CPU target and current utilization
+```
+
+**Test Prometheus scraping:**
+
+```bash
+kubectl port-forward svc/kps-kube-prometheus-stack-prometheus -n monitoring 9090:9090 &
+curl -s 'http://localhost:9090/api/v1/query?query=http_requests_total' | python3 -m json.tool | head -20
+# Expected: metric results with path="/", path="/healthz"
+
+curl -s 'http://localhost:9090/api/v1/rules' | python3 -m json.tool | grep QovesAPIHealthzFailing
+# Expected: the alert rule is loaded
+```
+
+**Test Grafana:**
+
+```bash
+kubectl port-forward svc/kps-grafana -n monitoring 3000:80 &
+# Open http://localhost:3000
+# Login: admin / prom-operator
+# Go to Explore → Prometheus → query: http_requests_total
+```
+
+**Verify no plaintext secrets in the repo:**
+
+```bash
+grep -r "changeme" manifests/ || echo "No plaintext secrets found - PASS"
+```
 
 ### Repo Layout
 
 ```
 qoves-assignment/
-  app/                          # Provided application
-    main.py
-    Dockerfile
-    requirements.txt
-  bootstrap/
-    root-application.yaml       # Root ArgoCD Application (app-of-apps)
-  applications/                 # Child ArgoCD Applications
-    secrets.yml                 # Sealed Secrets controller (wave 0)
-    database.yml                # PostgreSQL StatefulSet + PVC (wave 1)
-    ingress.yml                 # NetworkPolicies (wave 1)
-    api.yml                     # API Deployment + Service + Ingress + HPA (wave 2)
-    prometheus.yml              # kube-prometheus-stack Helm chart (wave 2)
-    monitoring.yml              # ServiceMonitor + PrometheusRule (wave 3)
-  manifests/
-    data/
-      postgres-statefulset.yaml
-      postgres-service.yaml
-      qoves-db-sealed.yaml
-    api/
-      deployment.yaml
-      service.yaml
-      ingress.yaml
-      hpa.yaml
-    network/
-      00-default-deny.yaml
-      10-allow.yaml
-    monitoring/
-      servicemonitor.yaml
-      prometheusrule.yaml
-  WRITEUP.md
+├── app/                          # Provided application
+│   ├── main.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── bootstrap/
+│   └── root-application.yaml     # Root ArgoCD Application (app-of-apps)
+├── applications/                 # Child ArgoCD Applications
+│   ├── secrets.yml               #   Sealed Secrets controller (wave 0)
+│   ├── database.yml              #   PostgreSQL StatefulSet + PVC (wave 1)
+│   ├── ingress.yml               #   NetworkPolicies (wave 1)
+│   ├── api.yml                   #   API Deployment + Service + Ingress + HPA (wave 2)
+│   ├── prometheus.yml            #   kube-prometheus-stack Helm chart (wave 2)
+│   └── monitoring.yml            #   ServiceMonitor + PrometheusRule (wave 3)
+├── manifests/
+│   ├── data/
+│   │   ├── postgres-statefulset.yaml
+│   │   ├── postgres-service.yaml
+│   │   └── qoves-db-sealed.yaml
+│   ├── api/
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   ├── ingress.yaml
+│   │   └── hpa.yaml
+│   ├── network/
+│   │   ├── 00-default-deny.yaml
+│   │   └── 10-allow.yaml
+│   └── monitoring/
+│       ├── servicemonitor.yaml
+│       └── prometheusrule.yaml
+├── WRITEUP.md
+├── README.md
+└── .gitignore
 ```
 
 ### Making a Change (GitOps Flow)
 
-1. Edit manifest(s) locally (e.g. bump replica count in `manifests/api/deployment.yaml`)
-2. `git commit` and `git push origin main`
-3. ArgoCD detects the diff within its poll interval (default 3 min) or sync manually: `argocd app sync root`
-4. The controller applies the change; `selfHeal: true` reverts any manual drift
+1. Edit manifest(s) locally (e.g. change `maxReplicas` in `manifests/api/hpa.yaml`)
+2. `git add . && git commit -m "description" && git push origin main`
+3. ArgoCD detects the diff within ~3 minutes (its default poll interval) and auto-syncs
+4. `selfHeal: true` means any manual `kubectl edit` drift is reverted automatically
 
-### Validation
-
-```bash
-# All resources
-kubectl get pods,svc,ingress,netpol -n qoves
-
-# ArgoCD app tree
-kubectl get applications -n argocd
-
-# Health check through the ingress (port-forward on macOS + Docker driver)
-kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 8080:80 &
-curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz   # Expected: "ok"
-curl -H "Host: qoves.local" http://127.0.0.1:8080/           # Expected: "hello from the QOVES take-home API"
-curl -H "Host: qoves.local" http://127.0.0.1:8080/metrics    # Expected: Prometheus metrics
-
-# Prove NetworkPolicy blocks unauthorized egress
-kubectl run test --rm -it --image=busybox:1.36 -n qoves --restart=Never -- wget -qO- --timeout=3 http://example.com
-# Expected: timeout (blocked by default-deny egress)
-
-# Prove DNS still resolves (allowed by allow-dns-egress)
-kubectl run test-dns --rm -it --image=busybox:1.36 -n qoves --restart=Never -- nslookup postgres.qoves.svc.cluster.local
-# Expected: resolves successfully
-
-# Verify data persistence
-kubectl delete pod postgres-0 -n qoves
-kubectl wait --for=condition=ready pod/postgres-0 -n qoves --timeout=120s
-curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz   # Expected: "ok" again
-
-# Verify Prometheus scraping
-kubectl port-forward svc/kps-kube-prometheus-stack-prometheus -n monitoring 9090:9090 &
-curl -s 'http://localhost:9090/api/v1/query?query=http_requests_total' | python3 -m json.tool | head -20
-
-# Verify Grafana
-kubectl port-forward svc/kps-grafana -n monitoring 3000:80 &
-# Open http://localhost:3000 — admin / prom-operator (default)
-
-# Verify no plaintext secrets in repo
-grep -r "changeme" manifests/ || echo "No plaintext secrets found - PASS"
-```
+No `kubectl apply` or `kubectl edit` on running workloads — git is the only path to change the cluster.
 
 ---
 
 ## 2. Decisions
 
-### CNI: Calico
+**CNI — Calico.** Alternatives: Cilium (eBPF, richer L7 policies), Flannel (no NetworkPolicy), minikube default (kindnet — silently ignores policies). Calico enforces NetworkPolicy out of the box, is widely deployed, and has lower overhead than Cilium on a local cluster. The assignment hints at it directly.
 
-**Decision:** Calico as the CNI plugin via `minikube start --cni=calico`.
+**Secrets — Sealed Secrets.** Alternatives: SOPS+age (needs ArgoCD plugin), ESO+Vault (needs a running Vault). Sealed Secrets is the simplest fully-local option: encrypt client-side, commit ciphertext, controller decrypts in-cluster. In production I would use ESO + Vault for rotation and audit trails.
 
-**Alternatives:** Cilium (eBPF-based, richer L7 policies), Flannel (simple but no NetworkPolicy enforcement), minikube default (kindnet — silently ignores NetworkPolicy).
+**Database — Raw StatefulSet.** Alternatives: CloudNativePG (automated failover, WAL archiving), Zalando operator, Bitnami Helm chart. A raw StatefulSet makes every piece visible — no operator to explain. The PVC uses ReadWriteOnce, binding the pod to one node. Data survives pod restarts but not node loss. CloudNativePG is the right production choice.
 
-**Why:** The assignment requires enforced NetworkPolicy. minikube's default CNI does not enforce policies — they are silently no-ops. Calico is the most widely deployed CNI for NetworkPolicy enforcement, has excellent documentation, low resource overhead on minikube, and is the CNI hinted in the assignment. Cilium would also work but adds complexity (eBPF kernel requirements) that is unnecessary for this scope.
-
-### Secrets: Sealed Secrets
-
-**Decision:** Bitnami Sealed Secrets for encrypting credentials into git.
-
-**Alternatives:** SOPS with age/PGP (requires ArgoCD plugin config), External Secrets Operator with Vault (heavier dependency, needs a running Vault instance).
-
-**Why:** Sealed Secrets is the simplest fully-local option. The controller runs in-cluster, `kubeseal` encrypts on the client side, and the SealedSecret resource is safe to commit. No external dependency. In production, I would pair this with or migrate to ESO + HashiCorp Vault for centralized rotation and audit logging, but for a local minikube demo Sealed Secrets delivers the guarantee — no plaintext in git — with minimal moving parts.
-
-### Database: Raw StatefulSet
-
-**Decision:** A single-replica PostgreSQL StatefulSet with a PVC, rather than CloudNativePG or Helm chart.
-
-**Alternatives:** CloudNativePG operator (automated failover, backups, WAL archiving), Zalando Postgres Operator, Crunchy PGO, Bitnami Helm chart.
-
-**Why:** The assignment asks for a trivial API with one database. A raw StatefulSet makes every piece visible and defensible — there is no operator magic to explain. The PVC uses `ReadWriteOnce`, which binds the pod to one node; data survives pod restarts but not node loss without a backup strategy. CloudNativePG would be the right choice in production (see Production Gaps).
-
-### Scaling Signal: CPU-based HPA
-
-**Decision:** HPA targeting 70% average CPU utilization, min 2 / max 5 replicas.
-
-**Alternatives:** Custom metrics (request rate via Prometheus Adapter), KEDA with external metrics.
-
-**Why:** CPU is the simplest signal and works out of the box with the metrics-server addon. However, for this specific API — a lightweight Flask app behind gunicorn where requests are I/O-bound (waiting on Postgres) — CPU is not the ideal signal. Request latency or request rate (`http_requests_total`) via Prometheus Adapter would better reflect actual load. CPU-based scaling risks under-reacting to I/O-bound saturation and over-reacting to brief CPU spikes. I chose CPU for simplicity and noted this tradeoff.
+**Scaling signal — CPU.** Alternatives: request rate via Prometheus Adapter, KEDA. CPU works out of the box with metrics-server. But this API is I/O-bound (waiting on Postgres), so CPU under-represents real load. Request rate or latency via Prometheus Adapter would be a better signal. I chose CPU for simplicity and noted the tradeoff.
 
 ---
 
@@ -201,35 +280,35 @@ grep -r "changeme" manifests/ || echo "No plaintext secrets found - PASS"
 
 On real bare metal, I would need to build or manage each of the following that minikube provides automatically:
 
-**Control-plane bootstrap:** minikube runs `kubeadm init` internally, generates certs, configures the API server, controller-manager, and scheduler. On bare metal: I would run `kubeadm init` myself, manage the CA, distribute kubeconfig files, and configure HA with multiple control-plane nodes behind a load balancer (e.g. HAProxy or kube-vip).
+**Control-plane bootstrap.** minikube runs `kubeadm init`, generates certs, configures API server, controller-manager, scheduler. On bare metal: run `kubeadm init` manually, manage CA distribution, configure HA control planes behind LB, HAProxy or kube-vip.
 
-**CNI installation:** minikube installs Calico manifests automatically with `--cni=calico`. On bare metal: I would apply the Calico manifests (or use the Tigera operator), configure BGP peering if needed, and manage IP pool sizing for the pod CIDR.
+**CNI install.** minikube applies Calico manifests automatically. On bare metal: apply Tigera operator manifests, configure BGP peering, manage IP pool sizing for the pod CIDR.
 
-**Ingress load-balancing:** minikube's ingress addon deploys an nginx ingress controller and binds it to the node IP. On bare metal: I would need an external load balancer (MetalLB for L2/BGP advertisement, or HAProxy/Nginx in front of worker nodes) to route external traffic to the ingress controller pods. There is no cloud LoadBalancer service type.
+**Ingress load-balancing.** minikube's addon deploys nginx ingress controller bound to the node IP. On bare metal: deploy MetalLB for L2/BGP advertisement or HAProxy in front of workers. No cloud LoadBalancer exists.
 
-**Storage provisioner:** minikube provides a built-in `hostPath` provisioner that auto-creates PVs for any PVC. On bare metal: I would deploy a CSI driver (e.g. Longhorn, Rook-Ceph, or OpenEBS) or configure NFS/iSCSI-backed PVs manually. `hostPath` is not suitable for production — it ties data to a single node with no replication.
+**Storage provisioner.** minikube provides a hostPath provisioner that auto-creates PVs. On bare metal: deploy a CSI driver (Longhorn, Rook-Ceph, OpenEBS) or configure NFS/iSCSI PVs. hostPath is not production-suitable — data is node-local with no replication.
 
-**etcd and its backup:** minikube runs a single etcd instance as a static pod. On bare metal: I would run a 3- or 5-node etcd cluster (odd quorum), configure TLS peer/client certs, set up automated snapshots (`etcdctl snapshot save`) on a cron, store them off-cluster (S3 or NFS), and regularly test restores. etcd is the single point of truth for the entire cluster — losing it without a backup means rebuilding from scratch.
+**etcd.** minikube runs a single etcd static pod. On bare metal: run a 3- or 5-node etcd cluster with TLS, automated snapshots via `etcdctl snapshot save` on a cron stored off-cluster, and tested restores. Losing etcd without a backup means rebuilding from scratch. truth for the entire cluster — losing it without a backup means rebuilding from scratch.
 
 ---
 
 ## 4. Production Gaps
 
-**High availability:** Single-replica Postgres is a single point of failure. Production needs a Postgres HA setup (CloudNativePG with streaming replication, or Patroni) with automated failover. The API deployment has 2 replicas but `PodAntiAffinity` should spread them across nodes/zones.
+**HA.** Single-replica Postgres is a SPOF. Needs CloudNativePG with streaming replication or Patroni. API replicas need PodAntiAffinity across nodes/zones.
 
-**Backups:** No backup strategy exists. Production needs: scheduled `pg_dump` or WAL archiving to object storage (S3/MinIO), with tested restore procedures. etcd snapshots should be taken regularly. PVC snapshots via VolumeSnapshot if the CSI driver supports it.
+**Backups.** No backup strategy. Needs scheduled `pg_dump` or WAL archiving to S3/MinIO, regular etcd snapshots, and tested restore procedures.
 
-**Real secret backend:** Sealed Secrets encrypts at rest in git but doesn't support rotation, audit logging, or dynamic credentials. Production should use External Secrets Operator + HashiCorp Vault (or AWS Secrets Manager / GCP Secret Manager) for centralized management, automatic rotation, and audit trails.
+**Secret backend.** Sealed Secrets lacks rotation, audit logging, dynamic credentials. Needs ESO + HashiCorp Vault or cloud-native secret managers.
 
-**TLS:** The ingress serves plain HTTP. Production needs cert-manager with Let's Encrypt (or internal CA) for automatic TLS certificate provisioning and renewal. All internal service-to-service traffic should use mTLS via a service mesh (Istio/Linkerd) or Calico's WireGuard encryption.
+**TLS.** Ingress serves plain HTTP. Needs cert-manager with Let's Encrypt, mTLS via service mesh (Istio/Linkerd) or Calico WireGuard for internal traffic.
 
-**Upgrade strategy:** No rollout strategy beyond Kubernetes default (RollingUpdate). Production needs: `PodDisruptionBudgets` to prevent total outage during node drains, a defined upgrade path for Kubernetes versions (drain, cordon, upgrade kubelet/kubeadm), and ArgoCD progressive delivery (Argo Rollouts with canary/blue-green).
+**Upgrades.** No PodDisruptionBudgets, no progressive delivery. Needs PDBs, a defined Kubernetes upgrade path, and Argo Rollouts for canary/blue-green deploys.
 
-**Multi-cluster:** Everything runs in a single minikube cluster. Production needs: separate clusters for staging/production, potentially across regions. GitOps would target different overlays per cluster (Kustomize overlays or Helm value files per environment).
+**Multi-cluster.** Single cluster. Needs staging/production separation with Kustomize overlays or Helm value files per environment.
 
-**Observability depth:** Only one alert rule exists. Production needs: full alerting (SLO-based — latency percentiles, error rates, saturation), structured logging (Loki or ELK), distributed tracing (OpenTelemetry + Jaeger/Tempo), and Grafana dashboards for the golden signals.
+**Observability.** One alert rule. Needs SLO-based alerting, structured logging (Loki), distributed tracing (OpenTelemetry + Tempo), and Grafana dashboards for golden signals.
 
-**Resource quotas and LimitRanges:** No namespace-level quotas. Production should set `ResourceQuota` and `LimitRange` on the `qoves` namespace to prevent runaway resource consumption and ensure every pod has requests/limits.
+**Resource quotas.** No namespace-level quotas. Needs ResourceQuota and LimitRange to cap consumption.
 
 ---
 
@@ -246,6 +325,7 @@ On real bare metal, I would need to build or manage each of the following that m
 ### Recovery Steps
 
 **Step 1 — Assess the damage:**
+
 ```bash
 kubectl describe pod postgres-0 -n qoves
 kubectl logs postgres-0 -n qoves --previous
@@ -253,6 +333,7 @@ kubectl get events -n qoves --sort-by='.lastTimestamp' | head -20
 ```
 
 **Step 2 — Check PVC status:**
+
 ```bash
 kubectl get pvc -n qoves
 # postgres-data-postgres-0 should show Bound — data is intact
@@ -263,20 +344,23 @@ Because the StatefulSet uses a PVC with `ReadWriteOnce`, the data persists on di
 **Step 3 — If the pod does not auto-recover (CrashLoopBackOff):**
 
 Check if the issue is resource-related:
+
 ```bash
 kubectl top pod postgres-0 -n qoves
 kubectl describe node $(kubectl get pod postgres-0 -n qoves -o jsonpath='{.spec.nodeName}')
 ```
 
 If OOMKilled — fix via git (GitOps flow):
+
 1. Edit `manifests/data/postgres-statefulset.yaml` — increase memory limit
-2. `git commit -m "increase postgres memory limit to 1Gi" && git push origin main`
+2. `git add . && git commit -m "increase postgres memory limit to 1Gi" && git push origin main`
 3. ArgoCD syncs the change; the StatefulSet rolls the pod with new limits
 4. Verify: `kubectl get pod postgres-0 -n qoves -w` — wait for Running
 
 **Step 4 — If the node itself died:**
 
 The PVC is `ReadWriteOnce` — it is bound to the old node. If the node comes back, the pod restarts. If the node is permanently gone:
+
 ```bash
 kubectl delete pod postgres-0 -n qoves --force --grace-period=0
 # The scheduler places it on a surviving node
@@ -286,13 +370,15 @@ kubectl delete pod postgres-0 -n qoves --force --grace-period=0
 With minikube's hostPath provisioner, data on a dead node is lost. This is a known limitation — see Production Gaps for the backup strategy that would mitigate this.
 
 **Step 5 — Verify recovery:**
+
 ```bash
-kubectl get pod postgres-0 -n qoves         # Running
-curl -H "Host: qoves.local" http://$(minikube ip)/healthz  # "ok"
+kubectl get pod postgres-0 -n qoves                                          # Running
+kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 8080:80 &
+curl -H "Host: qoves.local" http://127.0.0.1:8080/healthz                   # "ok"
 ```
 
 **Step 6 — Post-incident:**
 
-- Confirm the alert resolves automatically once `/healthz` returns 200
+- Confirm the `QovesAPIHealthzFailing` alert resolves automatically once `/healthz` returns 200
 - Check ArgoCD: `kubectl get applications -n argocd` — all apps should be Healthy/Synced
 - If any data was lost, restore from the most recent `pg_dump` backup (not applicable in this minikube setup — see Production Gaps)
